@@ -1,118 +1,107 @@
 # vps-mcp
 
-MCP-сервер для управления VPS-серверами через SSH. Даёт AI-ассистенту полный контроль над зарегистрированными серверами: выполнение команд, передача файлов, управление Docker, деплой приложений и автоматическое ведение документации.
+An MCP (Model Context Protocol) server for managing VPS servers via SSH. Connect it to Claude Code, Claude Desktop, or Claude.ai to execute commands, transfer files, manage Docker containers, and maintain per-server documentation — all from within Claude.
 
-## Содержание
+[Русская версия](README.ru.md)
 
-- [Как это работает](#как-это-работает)
-- [Установка](#установка)
-- [Использование локально (stdio)](#использование-локально-stdio)
-- [Деплой на VPS (HTTP)](#деплой-на-vps-http)
-- [Подключение к Claude.ai (web, OAuth)](#подключение-к-claudeai-web-oauth)
-- [Добавление сервера в vault](#добавление-сервера-в-vault)
-- [Инструменты](#инструменты)
-- [Типичные сценарии](#типичные-сценарии)
-- [Безопасность](#безопасность)
-- [Структура данных](#структура-данных)
+## Features
 
----
+- **SSH execution** — run commands and shell scripts on remote servers
+- **File transfer** — upload/download files via SFTP, list remote directories
+- **Docker management** — `docker ps`, `docker compose`, `docker exec`, deploy apps
+- **Server docs** — scan a server and generate/update Markdown documentation per server
+- **Encrypted vault** — server credentials stored with AES-256-GCM + PBKDF2
 
-## Как это работает
+## How it works
 
 ```
-Claude Code / Claude Desktop / Dispatch
-            │
-            │  MCP protocol
-            ▼
-      vps-mcp (этот сервер)
-            │
-            │  SSH / SFTP
-            ▼
-     Ваши VPS-серверы
+Claude Code / Claude Desktop / Claude.ai
+              │
+              │  MCP protocol
+              ▼
+        vps-mcp (this server)
+              │
+              │  SSH / SFTP
+              ▼
+       Your VPS servers
 ```
 
-vps-mcp хранит SSH-ключи и пароли в **зашифрованном vault** (AES-256-GCM). При вызове любого инструмента сервер открывает SSH-соединение с нужным VPS, выполняет действие и возвращает результат.
+vps-mcp stores SSH keys and passwords in an **encrypted vault** (AES-256-GCM). On every tool call it opens an SSH connection to the target server, executes the action, and returns the result.
 
-Поддерживает два режима транспорта:
-- **stdio** — для локального использования (Claude Code, Claude Desktop на том же компьютере)
-- **HTTP (Streamable HTTP)** — для удалённого доступа (другие устройства, Dispatch, claude.ai)
+Two transport modes are supported:
+- **stdio** — for local use (Claude Code, Claude Desktop on the same machine)
+- **HTTP (Streamable HTTP)** — for remote access (other devices, Claude.ai web)
 
----
+## Installation
 
-## Установка
-
-**Требования:** Node.js 20+
+**Requirements:** Node.js 20+
 
 ```bash
-git clone <repo>
+git clone https://github.com/ereskovsky/vps-mcp
 cd vps-mcp
 npm install
 npm run build
 ```
 
-Создайте `.env` из шаблона:
+Create `.env` from the template:
 
 ```bash
 cp .env.example .env
 ```
 
-Отредактируйте `.env`:
+Edit `.env`:
 
 ```env
-# Мастер-пароль для шифрования vault. Придумайте любой — это не внешний сервис.
-VAULT_PASSWORD=придумайте-сложный-пароль
+# Master password for the encrypted vault. Pick any strong passphrase.
+VAULT_PASSWORD=your-strong-passphrase
 
-# Bearer-токен для HTTP-режима (сгенерируйте случайную строку)
-API_KEY=сгенерируйте-через-openssl-rand-hex-32
+# Bearer token for HTTP mode (generate with: openssl rand -hex 32)
+API_KEY=your-random-api-key
 
-# Порт HTTP-сервера (по умолчанию 3001)
+# HTTP port (default: 3001)
 # PORT=3001
 
-# Для HTTP-режима с OAuth (нужно при подключении через Claude.ai web)
-BASE_URL=https://vps-mcp.yourdomain.com   # без порта — иначе OAuth metadata недоступен снаружи
-CLIENT_ID=vps-mcp                          # любая строка, будет нужна при подключении в Claude.ai
-CLIENT_SECRET=                             # по умолчанию равен API_KEY, можно задать отдельно
+# For HTTP mode with OAuth (required for Claude.ai web)
+BASE_URL=https://vps-mcp.yourdomain.com  # no port — required for OAuth metadata to work
+CLIENT_ID=vps-mcp                         # any string, needed when adding the integration in Claude.ai
+CLIENT_SECRET=                            # defaults to API_KEY if not set
 ```
 
----
+## Local usage (stdio)
 
-## Использование локально (stdio)
-
-Этот режим работает **без деплоя** — MCP-сервер запускается на вашем компьютере и подключается к VPS по SSH.
+This mode works **without any server deployment** — vps-mcp runs on your machine and connects to VPS servers over SSH.
 
 ### Claude Code
 
 ```bash
-claude mcp add vps-mcp -s user -e VAULT_PASSWORD="ваш-пароль" -- node "/путь/к/vps-mcp/dist/index.js" --stdio
+claude mcp add vps-mcp -s user -e VAULT_PASSWORD="your-password" -- node "/path/to/vps-mcp/dist/index.js" --stdio
 ```
 
 ### Claude Desktop
 
-Добавьте в `claude_desktop_config.json` (`~/Library/Application Support/Claude/` на Mac, `%APPDATA%\Claude\` на Windows):
+Add to `claude_desktop_config.json` (`~/Library/Application Support/Claude/` on Mac, `%APPDATA%\Claude\` on Windows):
 
 ```json
 {
   "mcpServers": {
     "vps-mcp": {
       "command": "node",
-      "args": ["/абсолютный/путь/к/vps-mcp/dist/index.js", "--stdio"],
+      "args": ["/absolute/path/to/vps-mcp/dist/index.js", "--stdio"],
       "env": {
-        "VAULT_PASSWORD": "ваш-пароль"
+        "VAULT_PASSWORD": "your-password"
       }
     }
   }
 }
 ```
 
----
+## Deploy to a VPS (HTTP mode)
 
-## Деплой на VPS (HTTP)
+Required for remote access from other devices or Claude.ai web.
 
-Нужен для доступа с других устройств, из браузера или через Dispatch.
+### 1. Prepare
 
-### 1. Подготовка
-
-Скопируйте проект на VPS (или сделайте `git clone`). В `Caddyfile` замените домен:
+Clone the repo on your VPS. Edit `Caddyfile` and replace the domain:
 
 ```
 vps-mcp.yourdomain.com {
@@ -120,30 +109,29 @@ vps-mcp.yourdomain.com {
 }
 ```
 
-Убедитесь, что DNS A-запись домена указывает на IP этого VPS.
+Make sure your domain's DNS A record points to the VPS IP.
 
-### 2. Запуск
+### 2. Start
 
 ```bash
-# На VPS
 cp .env.example .env
-# Заполните VAULT_PASSWORD и API_KEY
+# Fill in VAULT_PASSWORD and API_KEY
 
 docker compose up -d
 ```
 
-Caddy автоматически получит TLS-сертификат через Let's Encrypt.
+Caddy will automatically obtain a TLS certificate via Let's Encrypt.
 
-### 3. Подключение клиентов
+### 3. Connect clients
 
-Claude Code / Claude Desktop (удалённо):
+Claude Code / Claude Desktop (remote):
 
 ```bash
 claude mcp add vps-mcp -s user --transport http "https://vps-mcp.yourdomain.com/mcp" \
-  --header "Authorization: Bearer ваш-api-key"
+  --header "Authorization: Bearer your-api-key"
 ```
 
-Или вручную в конфиге:
+Or manually in config:
 
 ```json
 {
@@ -151,47 +139,43 @@ claude mcp add vps-mcp -s user --transport http "https://vps-mcp.yourdomain.com/
     "vps-mcp": {
       "url": "https://vps-mcp.yourdomain.com/mcp",
       "headers": {
-        "Authorization": "Bearer ваш-api-key"
+        "Authorization": "Bearer your-api-key"
       }
     }
   }
 }
 ```
 
----
+## Connecting to Claude.ai (web, OAuth)
 
-## Подключение к Claude.ai (web, OAuth)
+Claude.ai uses OAuth 2.0 (`authorization_code` + PKCE) to connect to remote MCP servers. vps-mcp implements the full OAuth flow.
 
-Claude.ai использует OAuth 2.0 (`authorization_code` + PKCE) для подключения к удалённым MCP-серверам. vps-mcp реализует полный OAuth flow.
+### Requirements
 
-### Требования
+- Server deployed and reachable over HTTPS
+- `BASE_URL` in `.env` must be the public domain **without a non-standard port** (e.g. `https://vps-mcp.yourdomain.com`, not `https://...:4443`) — otherwise Claude.ai cannot reach the `token_endpoint` from the OAuth metadata
 
-- Сервер задеплоен и доступен по HTTPS
-- `BASE_URL` в `.env` указывает на публичный домен **без нестандартного порта** (например `https://vps-mcp.yourdomain.com`, не `https://...:4443`) — иначе Claude.ai не сможет получить `token_endpoint` из OAuth metadata
+### Steps
 
-### Как подключить
-
-1. Откройте **Claude.ai → Settings → Integrations → Add integration**
-2. Введите URL: `https://vps-mcp.yourdomain.com/mcp`
-3. Введите **Client ID** (значение `CLIENT_ID` из `.env`)
-4. Введите **Client Secret** (значение `CLIENT_SECRET` из `.env`, по умолчанию равно `API_KEY`)
-5. Claude.ai откроет страницу авторизации, подтвердите доступ
+1. Open **Claude.ai → Settings → Integrations → Add integration**
+2. Enter URL: `https://vps-mcp.yourdomain.com/mcp`
+3. Enter **Client ID** (value of `CLIENT_ID` from `.env`)
+4. Enter **Client Secret** (value of `CLIENT_SECRET` from `.env`, defaults to `API_KEY`)
+5. Claude.ai will open an authorization page — confirm access
 
 ### OAuth endpoints
 
-| Endpoint | Описание |
-|----------|----------|
+| Endpoint | Description |
+|----------|-------------|
 | `GET /.well-known/oauth-authorization-server` | OAuth metadata (discovery) |
-| `GET /oauth/authorize` | Страница авторизации (редирект в браузере) |
-| `POST /oauth/token` | Обмен кода на токен |
+| `GET /oauth/authorize` | Authorization page (browser redirect) |
+| `POST /oauth/token` | Exchange code for token |
 
----
+## Adding a server to the vault
 
-## Добавление сервера в vault
+### Via SSH key (recommended)
 
-### Через SSH-ключ (рекомендуется)
-
-Сначала закодируйте ваш приватный ключ в base64:
+Encode your private key in base64 first:
 
 ```bash
 # Linux / Mac
@@ -201,7 +185,7 @@ base64 -w 0 ~/.ssh/id_ed25519
 [Convert]::ToBase64String([IO.File]::ReadAllBytes("$env:USERPROFILE\.ssh\id_ed25519"))
 ```
 
-Затем вызовите инструмент `add_server`:
+Then call the `add_server` tool:
 
 ```
 name: prod-1
@@ -209,12 +193,12 @@ host: 1.2.3.4
 port: 22
 username: root
 authType: key
-privateKey: <base64-строка из команды выше>
-passphrase: <пассфраза ключа, если есть>
-description: Основной продакшн сервер, nginx + 3 docker-контейнера
+privateKey: <base64 string from above>
+passphrase: <key passphrase, if any>
+description: Main production server
 ```
 
-### Через пароль
+### Via password
 
 ```
 name: staging
@@ -222,57 +206,48 @@ host: 5.6.7.8
 port: 22
 username: ubuntu
 authType: password
-password: ваш-ssh-пароль
-description: Стейджинг окружение
+password: your-ssh-password
+description: Staging environment
 ```
 
----
+## Tools
 
-## Инструменты
-
-### Registry — управление серверами
+### Registry — server management
 
 #### `list_servers`
-Возвращает список всех зарегистрированных серверов. Пароли и ключи **не показываются**.
-
-```
-→ Вызов: list_servers (без параметров)
-← Результат: [{ name, host, port, username, authType, description }]
-```
+Returns all registered servers. Passwords and keys are **never exposed**.
 
 #### `add_server`
-Добавляет новый сервер в зашифрованный vault.
 
-| Параметр | Тип | Обязательный | Описание |
-|---|---|---|---|
-| `name` | string | да | Уникальный идентификатор (латиница, цифры, `-_`) |
-| `host` | string | да | IP-адрес или hostname |
-| `port` | number | нет | SSH-порт (по умолчанию 22) |
-| `username` | string | да | SSH-пользователь |
-| `authType` | `key` / `password` | да | Тип аутентификации |
-| `privateKey` | string | если `key` | Base64-encoded PEM приватный ключ |
-| `passphrase` | string | нет | Пассфраза ключа |
-| `password` | string | если `password` | SSH-пароль |
-| `description` | string | нет | Описание сервера |
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `name` | string | yes | Unique identifier (letters, digits, `-_`) |
+| `host` | string | yes | IP address or hostname |
+| `port` | number | no | SSH port (default: 22) |
+| `username` | string | yes | SSH user |
+| `authType` | `key` / `password` | yes | Authentication type |
+| `privateKey` | string | if `key` | Base64-encoded PEM private key |
+| `passphrase` | string | no | Key passphrase |
+| `password` | string | if `password` | SSH password |
+| `description` | string | no | Server description |
 
 #### `remove_server`
-Удаляет сервер из vault.
 
-| Параметр | Тип | Описание |
-|---|---|---|
-| `name` | string | Имя сервера для удаления |
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `name` | string | Server name to remove |
 
 ---
 
-### SSH — выполнение команд
+### SSH — command execution
 
 #### `execute_command`
-Выполняет одну команду на сервере через SSH.
+Runs a single command on the server.
 
-| Параметр | Тип | Описание |
-|---|---|---|
-| `server` | string | Имя сервера из vault |
-| `command` | string | Shell-команда |
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `server` | string | Server name from vault |
+| `command` | string | Shell command |
 
 ```
 → execute_command(server="prod-1", command="df -h")
@@ -280,50 +255,39 @@ description: Стейджинг окружение
 ```
 
 #### `execute_script`
-Выполняет многострочный bash-скрипт.
+Runs a multi-line bash script.
 
-| Параметр | Тип | Описание |
-|---|---|---|
-| `server` | string | Имя сервера |
-| `script` | string | Bash-скрипт (многострочный) |
-
-```
-→ execute_script(server="prod-1", script="
-    cd /app
-    git log --oneline -5
-    systemctl status nginx
-  ")
-```
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `server` | string | Server name |
+| `script` | string | Bash script (multi-line) |
 
 ---
 
-### Files — передача файлов (SFTP)
+### Files — SFTP transfer
 
 #### `upload_file`
-Загружает локальный файл на сервер.
 
-| Параметр | Тип | Описание |
-|---|---|---|
-| `server` | string | Имя сервера |
-| `localPath` | string | Абсолютный путь к локальному файлу |
-| `remotePath` | string | Абсолютный путь назначения на сервере |
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `server` | string | Server name |
+| `localPath` | string | Absolute local file path |
+| `remotePath` | string | Absolute destination path on server |
 
 #### `download_file`
-Скачивает файл с сервера.
 
-| Параметр | Тип | Описание |
-|---|---|---|
-| `server` | string | Имя сервера |
-| `remotePath` | string | Путь к файлу на сервере |
-| `localPath` | string | Локальный путь для сохранения |
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `server` | string | Server name |
+| `remotePath` | string | File path on server |
+| `localPath` | string | Local save path |
 
 #### `list_remote_files`
-Выводит содержимое директории на сервере.
 
-| Параметр | Тип | Описание |
-|---|---|---|
-| `server` | string | Имя сервера |
-| `remotePath` | string | Путь к директории |
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `server` | string | Server name |
+| `remotePath` | string | Directory path on server |
 
 ```
 ← [{ name, type, size, modifiedAt, permissions }]
@@ -334,119 +298,89 @@ description: Стейджинг окружение
 ### Docker & Deploy
 
 #### `docker_ps`
-Выводит список Docker-контейнеров.
 
-| Параметр | Тип | Описание |
-|---|---|---|
-| `server` | string | Имя сервера |
-| `all` | boolean | Включать остановленные (по умолчанию: true) |
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `server` | string | Server name |
+| `all` | boolean | Include stopped containers (default: true) |
 
 #### `docker_compose`
-Запускает команду `docker compose` в указанной директории.
 
-| Параметр | Тип | Описание |
-|---|---|---|
-| `server` | string | Имя сервера |
-| `path` | string | Абсолютный путь к директории с `docker-compose.yml` |
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `server` | string | Server name |
+| `path` | string | Absolute path to directory with `docker-compose.yml` |
 | `action` | enum | `up` / `down` / `restart` / `pull` / `logs` / `ps` / `build` |
-| `service` | string | (опционально) Имя конкретного сервиса |
-| `flags` | string | (опционально) Дополнительные флаги |
-
-```
-→ docker_compose(server="prod-1", path="/app/my-project", action="logs", service="api", flags="--tail=100")
-```
+| `service` | string | (optional) Specific service name |
+| `flags` | string | (optional) Extra flags |
 
 #### `docker_exec`
-Выполняет команду внутри запущенного контейнера.
 
-| Параметр | Тип | Описание |
-|---|---|---|
-| `server` | string | Имя сервера |
-| `container` | string | Имя или ID контейнера |
-| `command` | string | Команда для выполнения |
-
-```
-→ docker_exec(server="prod-1", container="my-app", command="python manage.py migrate")
-```
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `server` | string | Server name |
+| `container` | string | Container name or ID |
+| `command` | string | Command to execute |
 
 #### `deploy_app`
-Деплоит приложение: git pull → build → restart.
+Deploys an app: git pull → build → restart.
 
-| Параметр | Тип | Описание |
-|---|---|---|
-| `server` | string | Имя сервера |
-| `path` | string | Путь к директории приложения |
-| `branch` | string | Git-ветка (по умолчанию: `main`) |
-| `buildCommand` | string | (опционально) Команда сборки |
-| `restartCommand` | string | (опционально) Команда перезапуска |
-
-```
-→ deploy_app(
-    server="prod-1",
-    path="/app/my-project",
-    branch="main",
-    buildCommand="npm run build",
-    restartCommand="docker compose up -d"
-  )
-← { success: true, steps: [{ step: "git pull", result: {...} }, ...] }
-```
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `server` | string | Server name |
+| `path` | string | App directory path |
+| `branch` | string | Git branch (default: `main`) |
+| `buildCommand` | string | (optional) Build command |
+| `restartCommand` | string | (optional) Restart command |
 
 ---
 
-### Docs — документация серверов
+### Docs — server documentation
 
 #### `scan_server`
-Сканирует сервер и возвращает полный снимок состояния:
-- OS и версия ядра
-- CPU и оперативная память
-- Использование дискового пространства
+Scans the server and returns a full snapshot:
+- OS and kernel version
+- CPU and RAM
+- Disk usage
 - Uptime
-- Запущенные Docker-контейнеры и образы
-- Запущенные systemd-сервисы
-- Открытые порты (ss / netstat)
-- Cron-задачи
-
-| Параметр | Тип | Описание |
-|---|---|---|
-| `server` | string | Имя сервера |
+- Running Docker containers and images
+- Active systemd services
+- Open ports (ss / netstat)
+- Cron jobs
 
 #### `get_server_docs`
-Читает существующую Markdown-документацию сервера из `data/docs/{server}.md`.
-
-| Параметр | Тип | Описание |
-|---|---|---|
-| `server` | string | Имя сервера |
+Reads stored Markdown documentation from `data/docs/{server}.md`.
 
 #### `update_server_docs`
-Записывает или заменяет Markdown-документацию сервера.
+Writes or replaces the Markdown documentation for a server.
 
-| Параметр | Тип | Описание |
-|---|---|---|
-| `server` | string | Имя сервера |
-| `content` | string | Полное содержимое Markdown-файла |
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `server` | string | Server name |
+| `content` | string | Full Markdown content |
 
 ---
 
-## Типичные сценарии
+## Common workflows
 
-### Первичное подключение нового сервера
+### Onboarding a new server
 
 ```
-1. add_server        — зарегистрировать сервер
-2. execute_command   — проверить подключение: "uptime"
-3. scan_server       — собрать снимок состояния
-4. update_server_docs — сохранить документацию
+1. add_server        — register the server
+2. execute_command   — verify connection: "uptime"
+3. scan_server       — collect a state snapshot
+4. update_server_docs — save documentation
 ```
 
-### Деплой приложения
+### Deploying an app
 
 ```
 1. deploy_app        — git pull + build + restart
-2. docker_ps         — проверить статус контейнеров
-3. docker_compose    — посмотреть логи: action="logs"
+2. docker_ps         — check container status
+3. docker_compose    — check logs: action="logs"
 ```
 
-### Отладка проблемы на сервере
+### Debugging a server issue
 
 ```
 1. execute_command   — "journalctl -u nginx --since '10 minutes ago'"
@@ -454,62 +388,37 @@ description: Стейджинг окружение
 3. execute_command   — "df -h && free -h"
 ```
 
-### Обновление документации после изменений
+## Security
+
+- **Vault** (`data/servers.enc.json`) is encrypted with AES-256-GCM; the key is derived via PBKDF2 (100,000 iterations) from `VAULT_PASSWORD`
+- SSH keys and passwords are **never stored or transmitted in plaintext** — only via the encrypted vault
+- The vault file and `data/` directory are in `.gitignore` — never committed to the repo
+- HTTP mode is protected by a Bearer token (`API_KEY`) on every request
+- When connecting via Claude.ai, OAuth 2.0 (`authorization_code` + PKCE) is used — no direct API key exposure to the client
+- HTTPS is handled by Caddy (automatic TLS via Let's Encrypt)
+- `list_servers` and logs never expose keys or passwords
+
+> **RAM note:** If your VPS has limited RAM (< 512 MB), avoid running `npm install` on the server — it may trigger the OOM killer. Install dependencies locally and upload `node_modules/`.
+
+## Project structure
 
 ```
-1. scan_server       — получить актуальное состояние
-2. get_server_docs   — прочитать существующую документацию
-   (AI объединяет результаты)
-3. update_server_docs — сохранить обновлённую документацию
+src/
+  index.ts               # Entry point — picks stdio vs HTTP mode
+  server.ts              # createServer() — wires all tool groups into McpServer
+  types.ts               # Shared types: ServerRecord, VaultData, CommandResult
+  lib/
+    credential-store.ts  # Encrypted vault (AES-256-GCM + PBKDF2)
+    ssh-client.ts        # SSH wrapper: execCommand, execScript, SFTP upload/download/list
+    doc-manager.ts       # Per-server Markdown docs (data/docs/{name}.md)
+  tools/
+    registry.ts          # list_servers, add_server, remove_server
+    ssh.ts               # execute_command, execute_script
+    files.ts             # upload_file, download_file, list_remote_files
+    deploy.ts            # docker_ps, docker_compose, docker_exec, deploy_app
+    docs.ts              # scan_server, get_server_docs, update_server_docs
 ```
 
-### Перенос конфига между серверами
+## License
 
-```
-1. download_file     — скачать конфиг с source-сервера
-2. upload_file       — загрузить на target-сервер
-3. execute_command   — перезапустить сервис
-```
-
----
-
-## Безопасность
-
-- **Vault** (`data/servers.enc.json`) зашифрован AES-256-GCM, ключ derivируется через PBKDF2 (100 000 итераций) из `VAULT_PASSWORD`
-- SSH-ключи и пароли **никогда не передаются в открытом виде** — только через зашифрованный vault
-- Файл vault и директория `data/` добавлены в `.gitignore` — не попадают в репозиторий
-- HTTP-режим защищён Bearer-токеном (`API_KEY`) на каждый запрос
-- При подключении через Claude.ai используется OAuth 2.0 (`authorization_code` + PKCE) — прямой доступ к API без передачи `API_KEY` на клиент
-- HTTPS обрабатывается Caddy (автоматический TLS через Let's Encrypt)
-- В `list_servers` и логах ключи/пароли **не отображаются**
-
----
-
-## Структура данных
-
-```
-vps-mcp/
-├── src/                        # Исходный код TypeScript
-│   ├── index.ts                # Точка входа, определение транспорта
-│   ├── server.ts               # McpServer и регистрация инструментов
-│   ├── types.ts                # Общие типы
-│   ├── lib/
-│   │   ├── credential-store.ts # Шифрование/дешифрование vault
-│   │   ├── ssh-client.ts       # SSH/SFTP клиент (обёртка над ssh2)
-│   │   └── doc-manager.ts      # Чтение/запись Markdown-документации
-│   └── tools/                  # Реализация MCP-инструментов
-│       ├── registry.ts
-│       ├── ssh.ts
-│       ├── files.ts
-│       ├── deploy.ts
-│       └── docs.ts
-├── dist/                       # Скомпилированный JS (генерируется npm run build)
-├── data/
-│   ├── servers.enc.json        # Зашифрованный vault (создаётся автоматически)
-│   └── docs/
-│       └── {server-name}.md    # Документация по каждому серверу
-├── docker-compose.yml          # Для деплоя: vps-mcp + Caddy
-├── Dockerfile
-├── Caddyfile                   # Конфиг reverse proxy
-└── .env.example                # Шаблон переменных окружения
-```
+MIT
