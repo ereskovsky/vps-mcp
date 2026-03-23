@@ -1,0 +1,4 @@
+# Replace with your actual domain pointing to this VPS
+vps-mcp.yourdomain.com {
+    reverse_proxy vps-mcp:3001
+}

@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.env
+CLAUDE.md
+data/servers.enc.json
+data/docs/
+*.js.map

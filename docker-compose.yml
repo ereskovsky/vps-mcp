@@ -1,0 +1,38 @@
+services:
+  vps-mcp:
+    build: .
+    image: vps-mcp:latest
+    container_name: vps-mcp
+    ports:
+      - "127.0.0.1:3001:3001"
+    environment:
+      - VAULT_PASSWORD=${VAULT_PASSWORD}
+      - API_KEY=${API_KEY}
+      - PORT=3001
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3001/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: vps-mcp-caddy
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - vps-mcp
+    restart: unless-stopped
+
+volumes:
+  caddy_data:
+  caddy_config:
