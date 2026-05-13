@@ -117,6 +117,117 @@ export async function downloadFile(
   });
 }
 
+/** Write a Buffer to a remote path via SFTP (single shot, in-memory). */
+export async function writeFileContent(
+  server: ServerRecord,
+  remotePath: string,
+  data: Buffer
+): Promise<void> {
+  const client = await connect(server);
+  const sftp = await getSftp(client);
+  return new Promise((resolve, reject) => {
+    sftp.writeFile(remotePath, data, (err) => {
+      client.end();
+      if (err) reject(err);
+      else resolve();
+    });
+  });
+}
+
+/** Read a remote file into a Buffer, rejecting if it exceeds maxBytes. */
+export async function readFileContent(
+  server: ServerRecord,
+  remotePath: string,
+  maxBytes: number
+): Promise<{ data: Buffer; size: number }> {
+  const client = await connect(server);
+  const sftp = await getSftp(client);
+  return new Promise((resolve, reject) => {
+    sftp.stat(remotePath, (statErr, stats) => {
+      if (statErr) {
+        client.end();
+        return reject(statErr);
+      }
+      const size = stats.size ?? 0;
+      if (size > maxBytes) {
+        client.end();
+        return reject(
+          new Error(
+            `File size ${size} bytes exceeds maxBytes ${maxBytes}. Use the HTTP /files/download endpoint for large files.`
+          )
+        );
+      }
+      sftp.readFile(remotePath, (readErr, data) => {
+        client.end();
+        if (readErr) reject(readErr);
+        else resolve({ data, size });
+      });
+    });
+  });
+}
+
+/** Stream a readable into a remote file via SFTP. Returns bytes written. */
+export async function uploadStream(
+  server: ServerRecord,
+  remotePath: string,
+  input: NodeJS.ReadableStream
+): Promise<number> {
+  const client = await connect(server);
+  const sftp = await getSftp(client);
+  return new Promise((resolve, reject) => {
+    const writeStream = sftp.createWriteStream(remotePath);
+    let bytes = 0;
+    let settled = false;
+    const finish = (err?: Error, value?: number) => {
+      if (settled) return;
+      settled = true;
+      client.end();
+      if (err) reject(err);
+      else resolve(value ?? 0);
+    };
+    input.on("data", (chunk: Buffer) => { bytes += chunk.length; });
+    input.on("error", (err: Error) => finish(err));
+    writeStream.on("error", (err: Error) => finish(err));
+    writeStream.on("close", () => finish(undefined, bytes));
+    input.pipe(writeStream);
+  });
+}
+
+/** Stream a remote file into a writable. Returns the source file size from SFTP stat. */
+export async function downloadStream(
+  server: ServerRecord,
+  remotePath: string,
+  output: NodeJS.WritableStream,
+  onSize?: (size: number) => void
+): Promise<number> {
+  const client = await connect(server);
+  const sftp = await getSftp(client);
+  return new Promise((resolve, reject) => {
+    sftp.stat(remotePath, (statErr, stats) => {
+      if (statErr) {
+        client.end();
+        return reject(statErr);
+      }
+      const size = stats.size ?? 0;
+      if (onSize) {
+        try { onSize(size); } catch (e) { /* ignore */ }
+      }
+      const readStream = sftp.createReadStream(remotePath);
+      let settled = false;
+      const finish = (err?: Error) => {
+        if (settled) return;
+        settled = true;
+        client.end();
+        if (err) reject(err);
+        else resolve(size);
+      };
+      readStream.on("error", (err: Error) => finish(err));
+      readStream.on("end", () => finish());
+      readStream.pipe(output, { end: true });
+    });
+  });
+}
+
 export interface RemoteFileEntry {
   name: string;
   type: "file" | "directory" | "symlink" | "other";

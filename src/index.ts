@@ -15,11 +15,17 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import express, { type Request, type Response, type NextFunction } from "express";
 import { createServer } from "./server.js";
+import { resolveServer } from "./tools/registry.js";
+import { uploadStream, downloadStream } from "./lib/ssh-client.js";
+import path from "path";
 
 const isStdio = process.argv.includes("--stdio");
 
 async function startStdio(): Promise<void> {
-  const server = createServer();
+  // stdio clients (Claude Code, Claude Desktop) have plenty of context — skip
+  // the meta-gateway and expose every tool directly to avoid the per-call
+  // `invoke_tool` wrapper and the search_tools/get_tool_schemas discovery dance.
+  const server = createServer("direct");
   const transport = new StdioServerTransport();
   await server.connect(transport);
   // stdio mode: keep process alive
@@ -35,8 +41,6 @@ async function startHttp(): Promise<void> {
   const port = parseInt(process.env.PORT ?? "3001", 10);
   const baseUrl = process.env.BASE_URL ?? `http://localhost:${port}`;
   const app = express();
-  app.use(express.json());
-  app.use(express.urlencoded({ extended: false }));
 
   // CORS — required for browser-initiated OAuth token requests
   app.use((req: Request, res: Response, next: NextFunction) => {
@@ -58,6 +62,65 @@ async function startHttp(): Promise<void> {
     }
     next();
   }
+
+  // ── File transfer endpoints ───────────────────────────────────────────────
+  // IMPORTANT: registered BEFORE express.json() so the raw request body stays
+  // available as a stream for SFTP upload.
+
+  // POST /files/upload?server=<name>&path=<absolute-remote-path>
+  //   Body: raw bytes. Streams directly to SFTP without buffering in RAM.
+  app.post("/files/upload", authenticate, async (req: Request, res: Response) => {
+    const serverName = (req.query.server as string) ?? "";
+    const remotePath = (req.query.path as string) ?? "";
+    if (!serverName || !remotePath) {
+      res.status(400).json({ error: "Missing required query params: server, path" });
+      return;
+    }
+    try {
+      const record = resolveServer(serverName);
+      const bytes = await uploadStream(record, remotePath, req);
+      res.json({ ok: true, server: serverName, path: remotePath, bytes });
+    } catch (err) {
+      if (!res.headersSent) {
+        res.status(500).json({ error: (err as Error).message });
+      } else {
+        res.end();
+      }
+    }
+  });
+
+  // GET /files/download?server=<name>&path=<absolute-remote-path>
+  //   Streams the remote file to the response body.
+  app.get("/files/download", authenticate, async (req: Request, res: Response) => {
+    const serverName = (req.query.server as string) ?? "";
+    const remotePath = (req.query.path as string) ?? "";
+    if (!serverName || !remotePath) {
+      res.status(400).json({ error: "Missing required query params: server, path" });
+      return;
+    }
+    try {
+      const record = resolveServer(serverName);
+      const filename = path.posix.basename(remotePath) || "download";
+      // Strip CR/LF and quotes from filename header (defense-in-depth)
+      const safeFilename = filename.replace(/[\r\n"]/g, "_");
+      res.setHeader("Content-Type", "application/octet-stream");
+      res.setHeader("Content-Disposition", `attachment; filename="${safeFilename}"`);
+      await downloadStream(record, remotePath, res, (size) => {
+        res.setHeader("Content-Length", String(size));
+      });
+    } catch (err) {
+      if (!res.headersSent) {
+        res.status(500).json({ error: (err as Error).message });
+      } else {
+        res.end();
+      }
+    }
+  });
+  // ──────────────────────────────────────────────────────────────────────────
+
+  // Body parsers — applied only to routes registered after this point.
+  app.use(express.json());
+  app.use(express.urlencoded({ extended: false }));
 
   // ── OAuth 2.0 (required by Claude.ai remote connectors) ──────────────────
 

@@ -7,7 +7,7 @@ An MCP (Model Context Protocol) server for managing VPS servers via SSH. Connect
 ## Features
 
 - **SSH execution** — run commands and shell scripts on remote servers
-- **File transfer** — upload/download files via SFTP, list remote directories
+- **File transfer** — SFTP plus three remote-friendly channels: inline content tools, streaming HTTP endpoints, and URL fetch-to-server
 - **Docker management** — `docker ps`, `docker compose`, `docker exec`, deploy apps
 - **Server docs** — scan a server and generate/update Markdown documentation per server
 - **Encrypted vault** — server credentials stored with AES-256-GCM + PBKDF2
@@ -210,6 +210,27 @@ password: your-ssh-password
 description: Staging environment
 ```
 
+## Tool discovery model (progressive discovery)
+
+When a client connects, `tools/list` returns **only 4 meta-tools**, not the 18 real ones. The model uses them to find and call the actual tools on demand, which keeps the LLM's "cold" context cost down to roughly **1K tokens instead of 5–10K**.
+
+| Meta-tool | What it does |
+|-----------|--------------|
+| `list_tool_categories` | Lists the 5 categories (registry, ssh, files, deploy, docs) with tool counts and descriptions. |
+| `search_tools` | Searches tools by `query` (substring against name/summary/description) and/or `category`. Returns lightweight `{name, category, summary}` — not full schemas. |
+| `get_tool_schemas` | Returns full descriptions and JSON Schema input definitions for 1–10 tools by name. |
+| `invoke_tool` | Executes a real tool: `{name, arguments}`. Arguments are strictly Zod-validated against the tool's schema. |
+
+Typical LLM workflow:
+
+```
+search_tools({query: "docker"})           → ["docker_ps", "docker_compose", "docker_exec", ...]
+get_tool_schemas({names: ["docker_ps"]})  → full schema for docker_ps
+invoke_tool({name: "docker_ps", arguments: {server: "prod"}}) → result
+```
+
+The real tools below are documented for human reference — the model discovers them through `search_tools` / `get_tool_schemas`.
+
 ## Tools
 
 ### Registry — server management
@@ -266,21 +287,62 @@ Runs a multi-line bash script.
 
 ### Files — SFTP transfer
 
+> **Important — local vs. remote mode**
+>
+> `upload_file` / `download_file` use `localPath` on the **MCP server's own filesystem**. In stdio mode that is your machine (works as expected). In HTTP/remote mode (Claude.ai web) the MCP server runs on a VPS — `localPath` then refers to that VPS, **not your machine**. For transfers from your machine in remote mode, use the inline content tools below or the HTTP file endpoints.
+
 #### `upload_file`
+
+Upload a file from the MCP server's local filesystem to a target VPS via SFTP.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `server` | string | Server name |
-| `localPath` | string | Absolute local file path |
-| `remotePath` | string | Absolute destination path on server |
+| `localPath` | string | Absolute path on the MCP server's filesystem |
+| `remotePath` | string | Absolute destination path on the target VPS |
 
 #### `download_file`
 
+Download a file from a target VPS to the MCP server's local filesystem via SFTP.
+
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `server` | string | Server name |
-| `remotePath` | string | File path on server |
-| `localPath` | string | Local save path |
+| `remotePath` | string | Path on the target VPS |
+| `localPath` | string | Path on the MCP server's filesystem |
+
+#### `upload_file_content`
+
+Write inline content to a remote file — no MCP-server-side file needed. Use this in remote mode for configs, scripts, and small code files the model generates in conversation. Soft ceiling ≈ 5 MB; for larger files use the `POST /files/upload` HTTP endpoint.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `server` | string | Server name |
+| `remotePath` | string | Absolute destination path on the target VPS |
+| `content` | string | File content (text or base64) |
+| `encoding` | `utf8` / `base64` | Default `utf8`. Use `base64` for binary data |
+
+#### `download_file_content`
+
+Read a remote file and return its content inline. Rejects files larger than `maxBytes` to protect the conversation context.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `server` | string | Server name |
+| `remotePath` | string | Path on the target VPS |
+| `encoding` | `utf8` / `base64` | Default `utf8`. Use `base64` for binary data |
+| `maxBytes` | number | Max bytes to read. Default 1 MB, hard cap 5 MB |
+
+#### `fetch_url_to_server`
+
+Download a file from a public URL **directly onto the VPS** via `curl`. Bytes don't pass through the MCP host or Claude — handy for release artifacts, transfer.sh links, raw gists, S3 presigned URLs.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `server` | string | Server name |
+| `url` | string | http/https source URL |
+| `remotePath` | string | Absolute destination on the VPS |
+| `timeoutSec` | number | `curl --max-time` (default 300, max 3600) |
 
 #### `list_remote_files`
 
@@ -291,6 +353,42 @@ Runs a multi-line bash script.
 
 ```
 ← [{ name, type, size, modifiedAt, permissions }]
+```
+
+---
+
+### HTTP file endpoints (large files, streamed)
+
+The HTTP server exposes two endpoints alongside `/mcp` for transferring files of any size. They stream directly between the user and the target VPS via SFTP, so they bypass the inline-content size limits of MCP tool calls. Use the same Bearer token as `/mcp`.
+
+#### `POST /files/upload?server=<name>&path=<absolute-remote-path>`
+
+Body: raw bytes (`Content-Type: application/octet-stream`). Response: `{ ok: true, server, path, bytes }`.
+
+```bash
+curl -H "Authorization: Bearer $API_KEY" \
+  --data-binary "@./local-archive.tar.gz" \
+  "https://vps-mcp.yourdomain.com/files/upload?server=prod-1&path=/tmp/local-archive.tar.gz"
+```
+
+PowerShell:
+
+```powershell
+curl -H "Authorization: Bearer $env:API_KEY" `
+  --data-binary "@./local-archive.tar.gz" `
+  "https://vps-mcp.yourdomain.com/files/upload?server=prod-1&path=/tmp/local-archive.tar.gz"
+```
+
+The destination directory must already exist (the endpoint does not auto-`mkdir`). After upload, ask Claude to unpack/move/install via `execute_command`.
+
+#### `GET /files/download?server=<name>&path=<absolute-remote-path>`
+
+Streams the remote file back as the response body with `Content-Disposition: attachment`.
+
+```bash
+curl -H "Authorization: Bearer $API_KEY" \
+  "https://vps-mcp.yourdomain.com/files/download?server=prod-1&path=/var/log/app.log" \
+  -o app.log
 ```
 
 ---
@@ -405,18 +503,20 @@ Writes or replaces the Markdown documentation for a server.
 ```
 src/
   index.ts               # Entry point — picks stdio vs HTTP mode
-  server.ts              # createServer() — wires all tool groups into McpServer
+  server.ts              # createServer() — registers ONLY the 4 meta-tools
   types.ts               # Shared types: ServerRecord, VaultData, CommandResult
   lib/
     credential-store.ts  # Encrypted vault (AES-256-GCM + PBKDF2)
     ssh-client.ts        # SSH wrapper: execCommand, execScript, SFTP upload/download/list
     doc-manager.ts       # Per-server Markdown docs (data/docs/{name}.md)
   tools/
-    registry.ts          # list_servers, add_server, remove_server
-    ssh.ts               # execute_command, execute_script
-    files.ts             # upload_file, download_file, list_remote_files
-    deploy.ts            # docker_ps, docker_compose, docker_exec, deploy_app
-    docs.ts              # scan_server, get_server_docs, update_server_docs
+    registry-core.ts     # Central registry, search, Zod→JSON Schema util, ToolDef type
+    meta.ts              # The 4 meta-tools (list_tool_categories, search_tools, get_tool_schemas, invoke_tool)
+    registry.ts          # getRegistryTools() — list_servers, add_server, remove_server
+    ssh.ts               # getSshTools()      — execute_command, execute_script
+    files.ts             # getFileTools()     — upload_file, download_file, upload_file_content, download_file_content, fetch_url_to_server, list_remote_files
+    deploy.ts            # getDeployTools()   — docker_ps, docker_compose, docker_exec, deploy_app
+    docs.ts              # getDocsTools()     — scan_server, get_server_docs, update_server_docs
 ```
 
 ## License

@@ -1,81 +1,54 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { execCommand, execScript } from "../lib/ssh-client.js";
+import { execScript } from "../lib/ssh-client.js";
 import { resolveServer } from "./registry.js";
+import { defineTool, type ToolDef } from "./registry-core.js";
 
-export function registerSshTools(server: McpServer): void {
-  // ── execute_command ───────────────────────────────────────────────────────
-  server.tool(
-    "execute_command",
-    "Execute a shell command on a VPS server via SSH and return stdout, stderr, and exit code",
-    {
-      server: z.string().min(1).describe("Server name as registered in the vault"),
-      command: z.string().min(1).describe("Shell command to execute"),
-    },
-    async (args, extra) => {
-      const log = async (msg: string) => {
-        try { await server.sendLoggingMessage({ level: "info", data: msg }, extra.sessionId); } catch {}
-      };
-      try {
-        const record = resolveServer(args.server);
-        await log(`[${args.server}] $ ${args.command}`);
-        const result = await execCommand(record, args.command);
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(
-                { stdout: result.stdout, stderr: result.stderr, exitCode: result.exitCode },
-                null,
-                2
-              ),
-            },
-          ],
-        };
-      } catch (err) {
-        return {
-          content: [{ type: "text", text: `Error: ${(err as Error).message}` }],
-          isError: true,
-        };
-      }
-    }
-  );
-
-  // ── execute_script ────────────────────────────────────────────────────────
-  server.tool(
-    "execute_script",
-    "Execute a multiline bash script on a VPS server via SSH",
-    {
-      server: z.string().min(1).describe("Server name as registered in the vault"),
-      script: z.string().min(1).describe("Bash script content (multiline supported)"),
-    },
-    async (args, extra) => {
-      const log = async (msg: string) => {
-        try { await server.sendLoggingMessage({ level: "info", data: msg }, extra.sessionId); } catch {}
-      };
-      try {
-        const record = resolveServer(args.server);
-        const lineCount = args.script.split("\n").length;
-        await log(`[${args.server}] Running script (${lineCount} lines)...`);
-        const result = await execScript(record, args.script);
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(
-                { stdout: result.stdout, stderr: result.stderr, exitCode: result.exitCode },
-                null,
-                2
-              ),
-            },
-          ],
-        };
-      } catch (err) {
-        return {
-          content: [{ type: "text", text: `Error: ${(err as Error).message}` }],
-          isError: true,
-        };
-      }
-    }
-  );
+export function getSshTools(): ToolDef[] {
+  return [
+    defineTool({
+      name: "execute_script",
+      category: "ssh",
+      summary: "Run one or more bash commands on a registered VPS over SSH (single-shot)",
+      description:
+        "Execute a bash script (one or more lines) on a VPS and return stdout, stderr, and exit code. " +
+        "ALWAYS prefer this over making many small calls — batch related commands into one script (use newlines, &&, ;). " +
+        "Each call opens a fresh SSH connection: 20 calls = 20 handshakes and 20 round-trips through the model context. " +
+        "If you need state to persist between commands (cd, env vars, background processes) or expect to issue 5+ commands " +
+        "against the same server, open a session_open instead and use session_exec.",
+      inputSchema: {
+        server: z.string().min(1).describe("Server name as registered in the vault"),
+        script: z
+          .string()
+          .min(1)
+          .describe(
+            "Bash script content. Single command or multiple lines — both work. Wrapped in `bash -c`."
+          ),
+      },
+      handler: async (args, extra) => {
+        try {
+          const record = resolveServer(args.server);
+          const lineCount = args.script.split("\n").length;
+          await extra.sendLog(`[${args.server}] Running script (${lineCount} line${lineCount === 1 ? "" : "s"})`);
+          const result = await execScript(record, args.script);
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  { stdout: result.stdout, stderr: result.stderr, exitCode: result.exitCode },
+                  null,
+                  2
+                ),
+              },
+            ],
+          };
+        } catch (err) {
+          return {
+            content: [{ type: "text", text: `Error: ${(err as Error).message}` }],
+            isError: true,
+          };
+        }
+      },
+    }),
+  ];
 }

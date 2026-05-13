@@ -230,6 +230,27 @@ description: Стейджинг окружение
 
 ---
 
+## Модель discovery инструментов (progressive discovery)
+
+При подключении клиента `tools/list` возвращает **только 4 мета-тула**, а не 18 настоящих. Модель находит и вызывает реальные инструменты по необходимости — это сокращает «холодную» стоимость контекста LLM с ~5–10K токенов до ~1K.
+
+| Мета-тул | Что делает |
+|----------|-----------|
+| `list_tool_categories` | Перечисляет 5 категорий (registry, ssh, files, deploy, docs) с количеством тулов и описаниями. |
+| `search_tools` | Поиск по `query` (подстрока в name/summary/description) и/или `category`. Возвращает лёгкие `{name, category, summary}` — без полных схем. |
+| `get_tool_schemas` | Возвращает полные описания и JSON Schema-входы для 1–10 тулов по имени. |
+| `invoke_tool` | Выполняет реальный тул: `{name, arguments}`. Аргументы строго валидируются Zod-схемой. |
+
+Типичный сценарий LLM:
+
+```
+search_tools({query: "docker"})           → ["docker_ps", "docker_compose", "docker_exec", ...]
+get_tool_schemas({names: ["docker_ps"]})  → полная схема docker_ps
+invoke_tool({name: "docker_ps", arguments: {server: "prod"}}) → результат
+```
+
+Реальные инструменты ниже задокументированы как справка для человека — модель обнаруживает их через `search_tools` / `get_tool_schemas`.
+
 ## Инструменты
 
 ### Registry — управление серверами
@@ -301,23 +322,57 @@ description: Стейджинг окружение
 
 ### Files — передача файлов (SFTP)
 
+> **Важно — локально vs. remote**
+>
+> `upload_file` / `download_file` используют `localPath` на **файловой системе MCP-сервера**. В stdio-режиме это ваш компьютер (работает как ожидается). В HTTP/remote режиме (Claude.ai web) MCP крутится на VPS — `localPath` тогда указывает на эту самую VPS, **не на вашу машину**. Для передачи файлов с вашей машины в remote-режиме используйте inline-content инструменты ниже или HTTP-эндпоинты `/files/*`.
+
 #### `upload_file`
-Загружает локальный файл на сервер.
+Загружает файл с локальной ФС MCP-сервера на целевой VPS (SFTP).
 
 | Параметр | Тип | Описание |
 |---|---|---|
 | `server` | string | Имя сервера |
-| `localPath` | string | Абсолютный путь к локальному файлу |
-| `remotePath` | string | Абсолютный путь назначения на сервере |
+| `localPath` | string | Абсолютный путь на ФС MCP-сервера |
+| `remotePath` | string | Абсолютный путь назначения на целевом VPS |
 
 #### `download_file`
-Скачивает файл с сервера.
+Скачивает файл с целевого VPS на локальную ФС MCP-сервера.
 
 | Параметр | Тип | Описание |
 |---|---|---|
 | `server` | string | Имя сервера |
-| `remotePath` | string | Путь к файлу на сервере |
-| `localPath` | string | Локальный путь для сохранения |
+| `remotePath` | string | Путь на целевом VPS |
+| `localPath` | string | Путь на ФС MCP-сервера |
+
+#### `upload_file_content`
+Записывает inline-контент в файл на VPS — без файла на стороне MCP-сервера. В remote-режиме это основной канал для конфигов, скриптов и кода, который модель генерирует прямо в диалоге. Лимит ≈ 5 MB; для больших файлов используйте HTTP-эндпоинт `POST /files/upload`.
+
+| Параметр | Тип | Описание |
+|---|---|---|
+| `server` | string | Имя сервера |
+| `remotePath` | string | Абсолютный путь назначения на VPS |
+| `content` | string | Содержимое файла (текст или base64) |
+| `encoding` | `utf8` / `base64` | По умолчанию `utf8`. Для бинарей — `base64` |
+
+#### `download_file_content`
+Читает файл с VPS и возвращает контент inline. Файлы больше `maxBytes` отвергаются, чтобы не съесть контекст.
+
+| Параметр | Тип | Описание |
+|---|---|---|
+| `server` | string | Имя сервера |
+| `remotePath` | string | Путь на VPS |
+| `encoding` | `utf8` / `base64` | По умолчанию `utf8`. Для бинарей — `base64` |
+| `maxBytes` | number | Лимит чтения. По умолчанию 1 MB, hard cap 5 MB |
+
+#### `fetch_url_to_server`
+Скачивает файл с публичного URL **прямо на VPS** через `curl`. Байты не идут через MCP-хост и не попадают в контекст модели — удобно для GitHub Releases, transfer.sh, raw gist'ов, S3 presigned URL.
+
+| Параметр | Тип | Описание |
+|---|---|---|
+| `server` | string | Имя сервера |
+| `url` | string | Источник (http/https) |
+| `remotePath` | string | Абсолютный путь назначения на VPS |
+| `timeoutSec` | number | `curl --max-time` (по умолчанию 300, максимум 3600) |
 
 #### `list_remote_files`
 Выводит содержимое директории на сервере.
@@ -329,6 +384,42 @@ description: Стейджинг окружение
 
 ```
 ← [{ name, type, size, modifiedAt, permissions }]
+```
+
+---
+
+### HTTP file endpoints (большие файлы, streaming)
+
+HTTP-сервер выставляет рядом с `/mcp` две ручки для передачи файлов произвольного размера. Они стримят байты напрямую между вашей машиной и целевым VPS через SFTP, минуя ограничения inline tool call'а MCP. Аутентификация — тот же Bearer-токен, что и у `/mcp`.
+
+#### `POST /files/upload?server=<имя>&path=<абсолютный-путь>`
+
+Body: сырые байты (`Content-Type: application/octet-stream`). Ответ: `{ ok: true, server, path, bytes }`.
+
+```bash
+curl -H "Authorization: Bearer $API_KEY" \
+  --data-binary "@./local-archive.tar.gz" \
+  "https://vps-mcp.yourdomain.com/files/upload?server=prod-1&path=/tmp/local-archive.tar.gz"
+```
+
+PowerShell:
+
+```powershell
+curl -H "Authorization: Bearer $env:API_KEY" `
+  --data-binary "@./local-archive.tar.gz" `
+  "https://vps-mcp.yourdomain.com/files/upload?server=prod-1&path=/tmp/local-archive.tar.gz"
+```
+
+Родительская директория должна существовать (ручка не делает `mkdir`). После загрузки попросите модель распаковать/переложить файл через `execute_command`.
+
+#### `GET /files/download?server=<имя>&path=<абсолютный-путь>`
+
+Стримит файл с VPS в тело ответа, заголовок `Content-Disposition: attachment`.
+
+```bash
+curl -H "Authorization: Bearer $API_KEY" \
+  "https://vps-mcp.yourdomain.com/files/download?server=prod-1&path=/var/log/app.log" \
+  -o app.log
 ```
 
 ---
@@ -471,6 +562,18 @@ description: Стейджинг окружение
 1. download_file     — скачать конфиг с source-сервера
 2. upload_file       — загрузить на target-сервер
 3. execute_command   — перезапустить сервис
+```
+
+### Залить локальный архив на VPS (remote-режим)
+
+```
+# С локальной машины
+curl -H "Authorization: Bearer $API_KEY" --data-binary "@./build.tar.gz" \
+  "https://vps-mcp.yourdomain.com/files/upload?server=prod-1&path=/tmp/build.tar.gz"
+
+# Потом в чате:
+1. execute_command   — "mkdir -p /opt/app && tar -xzf /tmp/build.tar.gz -C /opt/app"
+2. docker_compose    — action="up", flags="-d --build"
 ```
 
 ---
