@@ -67,7 +67,7 @@ export function getDocsTools(): ToolDef[] {
       handler: async (args, extra) => {
         try {
           const record = resolveServer(args.server);
-          await extra.sendLog(`[${args.server}] Scanning server environment...`);
+          await extra.sendLog(`[${args.server}] Running scan_server snapshot...`);
           const result = await execCommand(record, SCAN_SCRIPT);
           const output = result.stdout + (result.stderr ? `\n\n[stderr]\n${result.stderr}` : "");
           return {

@@ -4,8 +4,10 @@ import {
   CATEGORY_DESCRIPTIONS,
   createToolRegistry,
   findToolByName,
+  listAllToolNames,
   listCategories,
   searchTools,
+  suggestToolNames,
   toolInputJsonSchema,
   type ToolCategory,
   type ToolExtra,
@@ -121,11 +123,21 @@ export function registerMetaTools(server: McpServer): void {
     async (args, mcpExtra) => {
       const tool = findToolByName(args.name);
       if (!tool) {
+        const suggestions = suggestToolNames(args.name);
+        const available = listAllToolNames()
+          .map((t) => `${t.name} (${t.category})`)
+          .join(", ");
+        const didYouMean = suggestions.length
+          ? ` Did you mean: ${suggestions.join(", ")}?`
+          : "";
         return {
           content: [
             {
               type: "text",
-              text: `Error: tool '${args.name}' not found. Call search_tools to discover available tools.`,
+              text:
+                `Error: tool '${args.name}' not found.${didYouMean}\n\n` +
+                `Available tools: ${available}\n\n` +
+                `Tip: use search_tools / get_tool_schemas to confirm exact names before invoke_tool.`,
             },
           ],
           isError: true,
