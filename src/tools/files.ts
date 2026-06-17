@@ -8,6 +8,7 @@ import {
   execCommand,
 } from "../lib/ssh-client.js";
 import { resolveServer } from "./registry.js";
+import { signTransferToken } from "../lib/transfer-token.js";
 import { defineTool, type ToolDef } from "./registry-core.js";
 
 const INLINE_DOWNLOAD_HARD_CAP = 5 * 1024 * 1024; // 5 MB
@@ -19,6 +20,101 @@ function shellEscape(s: string): string {
 
 export function getFileTools(): ToolDef[] {
   return [
+    defineTool({
+      name: "prepare_file_transfer",
+      category: "files",
+      summary:
+        "Get a ready-to-run curl command (no base64) to stream a local file to/from a VPS at full speed",
+      description:
+        "PREFERRED way to move a real file between the user's LOCAL machine (where Claude Code runs) and a VPS. Returns a ready-to-run curl command (PowerShell `curl.exe` + bash variants) plus a short-lived scoped token. The model runs the command in its LOCAL shell: bytes stream local↔server over HTTPS and NEVER pass through the conversation or base64 — so there is no size cap and no refusal. Use this instead of upload_file_content for anything that is not tiny inline text: binaries, archives, deploy artifacts. direction='upload' pushes a local file to the VPS; 'download' pulls a remote file to local. After running it, confirm the command exits 0 / prints HTTP 200, then verify integrity with the returned check.",
+      inputSchema: {
+        server: z.string().min(1).describe("Server name as registered in the vault"),
+        remotePath: z
+          .string()
+          .min(1)
+          .describe(
+            "Absolute path of the file ON THE VPS (destination for upload, source for download)"
+          ),
+        direction: z
+          .enum(["upload", "download"])
+          .default("upload")
+          .describe("'upload' = local→VPS, 'download' = VPS→local"),
+        expiresInSec: z
+          .number()
+          .int()
+          .positive()
+          .max(3600)
+          .default(900)
+          .describe("Scoped-token lifetime in seconds (default 900 = 15 min)"),
+      },
+      handler: async (args, extra) => {
+        try {
+          resolveServer(args.server); // validate the server exists (throws otherwise)
+          const op = args.direction;
+          const baseUrl =
+            process.env.BASE_URL ?? `http://localhost:${process.env.PORT ?? "3001"}`;
+          const { token, expiresAt } = signTransferToken({
+            server: args.server,
+            path: args.remotePath,
+            op,
+            expiresInSec: args.expiresInSec,
+          });
+          const qs =
+            `server=${encodeURIComponent(args.server)}` +
+            `&path=${encodeURIComponent(args.remotePath)}`;
+          const url = `${baseUrl}/files/${op}?${qs}`;
+          const authHeader = `Authorization: Bearer ${token}`;
+          const placeholder = "<LOCAL_FILE>"; // model substitutes the absolute local path
+
+          let powershell: string;
+          let bash: string;
+          if (op === "upload") {
+            powershell = `curl.exe --fail-with-body -sS -w "\\nHTTP %{http_code}, %{size_upload} bytes" -H "${authHeader}" --data-binary "@${placeholder}" "${url}"`;
+            bash = `curl --fail-with-body -sS -w '\\nHTTP %{http_code}, %{size_upload} bytes' -H '${authHeader}' --data-binary "@${placeholder}" "${url}"`;
+          } else {
+            powershell = `curl.exe --fail-with-body -sS -w "\\nHTTP %{http_code}, %{size_download} bytes" -H "${authHeader}" -o "${placeholder}" "${url}"`;
+            bash = `curl --fail-with-body -sS -w '\\nHTTP %{http_code}, %{size_download} bytes' -H '${authHeader}' -o "${placeholder}" "${url}"`;
+          }
+
+          const verify =
+            op === "upload"
+              ? `After upload, verify integrity: run execute_script on '${args.server}' with \`sha256sum ${JSON.stringify(
+                  args.remotePath
+                )}\` and compare to the local file (PowerShell: \`Get-FileHash -Algorithm SHA256 <LOCAL_FILE>\`). The two hashes MUST match.`
+              : `After download, verify integrity: compare the local file's SHA-256 to \`sha256sum ${JSON.stringify(
+                  args.remotePath
+                )}\` run via execute_script on '${args.server}'. The two hashes MUST match.`;
+
+          await extra.sendLog(
+            `[${args.server}] Minted ${op} token for ${args.remotePath} (TTL ${args.expiresInSec}s)`
+          );
+
+          const result = {
+            direction: op,
+            server: args.server,
+            remotePath: args.remotePath,
+            url,
+            expires_at: new Date(expiresAt * 1000).toISOString(),
+            expires_in_sec: args.expiresInSec,
+            instructions:
+              `Run EXACTLY one of the commands below in your LOCAL shell (PowerShell → use 'powershell' with curl.exe, NOT the 'curl' alias; Bash tool → use 'bash'). Replace ONLY ${placeholder} with the absolute local path — keep the token, header, and URL verbatim. Confirm the command exits 0 and prints "HTTP 200". On any HTTP error, FIX it — never fall back to base64/upload_file_content.`,
+            powershell,
+            bash,
+            verify,
+          };
+
+          return {
+            content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+          };
+        } catch (err) {
+          return {
+            content: [{ type: "text", text: `Error: ${(err as Error).message}` }],
+            isError: true,
+          };
+        }
+      },
+    }),
+
     defineTool({
       name: "upload_file",
       category: "files",
@@ -92,7 +188,7 @@ export function getFileTools(): ToolDef[] {
       category: "files",
       summary: "Write inline content to a remote file on a VPS (small files, ≤5 MB)",
       description:
-        "Write inline content to a file on a VPS via SFTP. Use this to push small files (configs, scripts, generated code) directly from the conversation without needing a local file on the MCP server. Use 'base64' encoding for binary data. Typical safe ceiling ~5 MB; for larger files use the HTTP POST /files/upload endpoint.",
+        "Write SMALL inline TEXT you generate (configs, scripts, snippets) to a file on a VPS via SFTP. Do NOT use this to move an existing LOCAL file or any binary — base64-ing real files routes the bytes through the conversation (slow, hard ~5 MB cap, frequently refused). For ANY real file, binary, archive, or deploy artifact, use `prepare_file_transfer` instead. Reserve 'base64' here for tiny binary blobs you must inline.",
       inputSchema: {
         server: z.string().min(1).describe("Server name as registered in the vault"),
         remotePath: z.string().min(1).describe("Absolute path on the target VPS"),

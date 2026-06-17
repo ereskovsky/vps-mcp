@@ -115,6 +115,48 @@ export function getRegistryTools(): ToolDef[] {
     }),
 
     defineTool({
+      name: "update_server_description",
+      category: "registry",
+      summary: "Edit the description of a registered VPS (credentials untouched)",
+      description:
+        "Update the human-readable description of an already-registered VPS server. Only the description field is rewritten — host, port, username, and all credentials stay exactly as they are. Safer than remove_server + add_server when you just need to fix or refresh what a server is running.",
+      inputSchema: {
+        name: z.string().min(1).describe("Name of the server to update"),
+        description: z
+          .string()
+          .describe("New description (pass an empty string to clear it)"),
+      },
+      handler: async ({ name, description }, extra) => {
+        await extra.sendLog(`Updating description for server '${name}'`);
+        const vault = loadVault();
+        const server = vault.servers.find((s) => s.name === name);
+
+        if (!server) {
+          return {
+            content: [{ type: "text", text: `Error: server '${name}' not found.` }],
+            isError: true,
+          };
+        }
+
+        const previous = server.description ?? "";
+        server.description = description;
+        saveVault(vault);
+
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `Description for '${name}' updated.\n\n` +
+                `Before: ${previous || "(empty)"}\n` +
+                `After:  ${description || "(empty)"}`,
+            },
+          ],
+        };
+      },
+    }),
+
+    defineTool({
       name: "remove_server",
       category: "registry",
       summary: "Remove a VPS server from the encrypted vault",

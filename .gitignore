@@ -2,6 +2,8 @@ node_modules/
 dist/
 .env
 CLAUDE.md
+AGENTS.md
+.claude/
 data/servers.enc.json
 data/docs/
 *.js.map

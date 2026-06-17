@@ -17,6 +17,7 @@ import express, { type Request, type Response, type NextFunction } from "express
 import { createServer } from "./server.js";
 import { resolveServer } from "./tools/registry.js";
 import { uploadStream, downloadStream } from "./lib/ssh-client.js";
+import { verifyTransferToken, type TransferOp } from "./lib/transfer-token.js";
 import path from "path";
 
 const isStdio = process.argv.includes("--stdio");
@@ -63,13 +64,51 @@ async function startHttp(): Promise<void> {
     next();
   }
 
+  // Auth for the streaming file endpoints: accept EITHER the master API_KEY
+  // (header or ?key=, full access) OR a short-lived scoped transfer token bound
+  // to this exact server + path + operation. Scoped tokens let `prepare_file_transfer`
+  // hand the model a self-contained command without exposing the master key.
+  function transferAuth(op: TransferOp) {
+    return (req: Request, res: Response, next: NextFunction): void => {
+      const auth = req.headers.authorization ?? "";
+      const bearer = auth.startsWith("Bearer ") ? auth.slice("Bearer ".length) : "";
+      const queryKey = (req.query.key as string) ?? "";
+
+      // Master key — full access (header or query).
+      if (bearer === apiKey || queryKey === apiKey) {
+        next();
+        return;
+      }
+
+      // Scoped token — from the Authorization header or ?token=.
+      const token = bearer || ((req.query.token as string) ?? "");
+      const serverName = (req.query.server as string) ?? "";
+      const remotePath = (req.query.path as string) ?? "";
+      if (
+        token &&
+        serverName &&
+        remotePath &&
+        verifyTransferToken(token, { server: serverName, path: remotePath, op })
+      ) {
+        next();
+        return;
+      }
+
+      res.set(
+        "WWW-Authenticate",
+        `Bearer realm="vps-mcp", resource_metadata="${baseUrl}/.well-known/oauth-protected-resource"`
+      );
+      res.status(401).json({ error: "Unauthorized" });
+    };
+  }
+
   // ── File transfer endpoints ───────────────────────────────────────────────
   // IMPORTANT: registered BEFORE express.json() so the raw request body stays
   // available as a stream for SFTP upload.
 
   // POST /files/upload?server=<name>&path=<absolute-remote-path>
   //   Body: raw bytes. Streams directly to SFTP without buffering in RAM.
-  app.post("/files/upload", authenticate, async (req: Request, res: Response) => {
+  app.post("/files/upload", transferAuth("upload"), async (req: Request, res: Response) => {
     const serverName = (req.query.server as string) ?? "";
     const remotePath = (req.query.path as string) ?? "";
     if (!serverName || !remotePath) {
@@ -91,7 +130,7 @@ async function startHttp(): Promise<void> {
 
   // GET /files/download?server=<name>&path=<absolute-remote-path>
   //   Streams the remote file to the response body.
-  app.get("/files/download", authenticate, async (req: Request, res: Response) => {
+  app.get("/files/download", transferAuth("download"), async (req: Request, res: Response) => {
     const serverName = (req.query.server as string) ?? "";
     const remotePath = (req.query.path as string) ?? "";
     if (!serverName || !remotePath) {

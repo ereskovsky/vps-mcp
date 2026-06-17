@@ -11,7 +11,7 @@ import { getDocsTools } from "./docs.js";
 export type ToolCategory = "registry" | "ssh" | "sessions" | "files" | "deploy" | "docs";
 
 export const CATEGORY_DESCRIPTIONS: Record<ToolCategory, string> = {
-  registry: "Manage registered VPS servers in the encrypted vault (list, add, remove)",
+  registry: "Manage registered VPS servers in the encrypted vault (list, add, edit description, remove)",
   ssh: "Execute single bash scripts on a VPS over SSH (one-shot, fresh connection each call)",
   sessions: "Open a persistent SSH shell for sequences of commands with state (cwd/env) preserved between calls",
   files: "Transfer files and directory listings between the MCP host, public URLs, and a VPS",
