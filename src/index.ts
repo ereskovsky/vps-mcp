@@ -18,6 +18,8 @@ import { createServer } from "./server.js";
 import { resolveServer } from "./tools/registry.js";
 import { uploadStream, downloadStream } from "./lib/ssh-client.js";
 import { verifyTransferToken, type TransferOp } from "./lib/transfer-token.js";
+import { signAccessToken, verifyAccessToken, signAuthCode, verifyAuthCode } from "./lib/access-token.js";
+import { timingSafeEqual } from "crypto";
 import path from "path";
 
 const isStdio = process.argv.includes("--stdio");
@@ -52,30 +54,41 @@ async function startHttp(): Promise<void> {
     next();
   });
 
-  // Bearer token authentication middleware (header or ?key= query param)
-  function authenticate(req: Request, res: Response, next: NextFunction): void {
-    const auth = req.headers.authorization ?? "";
-    const queryKey = (req.query.key as string) ?? "";
-    if (auth !== `Bearer ${apiKey}` && queryKey !== apiKey) {
-      res.set("WWW-Authenticate", `Bearer realm="vps-mcp", resource_metadata="${baseUrl}/.well-known/oauth-protected-resource"`);
-      res.status(401).json({ error: "Unauthorized" });
-      return;
-    }
-    next();
+  // Constant-time string compare (don't leak the key length-by-length via early-exit).
+  function safeEqualStr(a: string, b: string): boolean {
+    const ab = Buffer.from(a);
+    const bb = Buffer.from(b);
+    return ab.length === bb.length && timingSafeEqual(ab, bb);
   }
 
-  // Auth for the streaming file endpoints: accept EITHER the master API_KEY
-  // (header or ?key=, full access) OR a short-lived scoped transfer token bound
-  // to this exact server + path + operation. Scoped tokens let `prepare_file_transfer`
-  // hand the model a self-contained command without exposing the master key.
+  // Bearer authentication — HEADER ONLY (no ?key= query, which leaks via access
+  // logs, Referer headers, and browser history). Accepts the master API_KEY
+  // (admin / break-glass) OR a signed, short-lived, audience-bound access token
+  // minted by /oauth/token (the connector path). The master key is never handed
+  // out as an OAuth token anymore.
+  function authenticate(req: Request, res: Response, next: NextFunction): void {
+    const auth = req.headers.authorization ?? "";
+    const bearer = auth.startsWith("Bearer ") ? auth.slice("Bearer ".length) : "";
+    if (bearer && (safeEqualStr(bearer, apiKey!) || verifyAccessToken(bearer, { audience: baseUrl }))) {
+      next();
+      return;
+    }
+    res.set("WWW-Authenticate", `Bearer realm="vps-mcp", resource_metadata="${baseUrl}/.well-known/oauth-protected-resource"`);
+    res.status(401).json({ error: "Unauthorized" });
+  }
+
+  // Auth for the streaming file endpoints: accept EITHER full access (master
+  // API_KEY or a signed access token, HEADER ONLY) OR a short-lived scoped
+  // transfer token bound to this exact server + path + operation. Scoped tokens
+  // let `prepare_file_transfer` hand the model a self-contained command (they may
+  // ride in ?token= for a curl one-liner); the master key never travels in a query.
   function transferAuth(op: TransferOp) {
     return (req: Request, res: Response, next: NextFunction): void => {
       const auth = req.headers.authorization ?? "";
       const bearer = auth.startsWith("Bearer ") ? auth.slice("Bearer ".length) : "";
-      const queryKey = (req.query.key as string) ?? "";
 
-      // Master key — full access (header or query).
-      if (bearer === apiKey || queryKey === apiKey) {
+      // Full access — master key or signed access token (header only).
+      if (bearer && (safeEqualStr(bearer, apiKey!) || verifyAccessToken(bearer, { audience: baseUrl }))) {
         next();
         return;
       }
@@ -179,18 +192,23 @@ async function startHttp(): Promise<void> {
 
   const CLIENT_ID = process.env.CLIENT_ID ?? "vps-mcp";
   const CLIENT_SECRET = process.env.CLIENT_SECRET ?? apiKey;
+  const ACCESS_TOKEN_TTL = parseInt(process.env.ACCESS_TOKEN_TTL_SECONDS ?? "86400", 10);
 
-  // Authorization endpoint — auto-redirect, embeds PKCE challenge in code
+  // Authorization endpoint — auto-redirect with a SIGNED, short-lived code that
+  // carries only the PKCE challenge (no secret), so it is safe in the redirect URL.
   app.get("/oauth/authorize", (req: Request, res: Response) => {
     const { redirect_uri, state, client_id, code_challenge, code_challenge_method } = req.query as Record<string, string>;
     if (client_id !== CLIENT_ID) {
       res.status(400).json({ error: "invalid_client" });
       return;
     }
-    // Encode {apiKey, code_challenge} stateless so we can validate PKCE at token exchange
-    const payload = Buffer.from(JSON.stringify({ k: apiKey, cc: code_challenge ?? "", cm: code_challenge_method ?? "" })).toString("base64url");
+    const code = signAuthCode({
+      codeChallenge: code_challenge ?? "",
+      codeChallengeMethod: code_challenge_method ?? "",
+      expiresInSec: 300,
+    });
     const url = new URL(redirect_uri);
-    url.searchParams.set("code", payload);
+    url.searchParams.set("code", code);
     if (state) url.searchParams.set("state", state);
     res.redirect(url.toString());
   });
@@ -203,13 +221,24 @@ async function startHttp(): Promise<void> {
       return;
     }
 
+    // Mint a signed, short-lived, audience-bound token — NOT the master API_KEY.
+    const issue = () => {
+      const { token, expiresIn } = signAccessToken({
+        audience: baseUrl,
+        issuer: baseUrl,
+        clientId: CLIENT_ID,
+        expiresInSec: ACCESS_TOKEN_TTL,
+      });
+      res.json({ access_token: token, token_type: "bearer", expires_in: expiresIn });
+    };
+
     // client_credentials — Claude.ai uses this when Client ID + Secret are provided in connector settings
     if (grant_type === "client_credentials") {
       if (client_secret !== CLIENT_SECRET) {
         res.status(401).json({ error: "invalid_client" });
         return;
       }
-      res.json({ access_token: apiKey, token_type: "bearer", expires_in: 86400 });
+      issue();
       return;
     }
 
@@ -217,31 +246,31 @@ async function startHttp(): Promise<void> {
       res.status(400).json({ error: "unsupported_grant_type" });
       return;
     }
-    // Validate client_secret if provided (public clients may omit it)
+    // Validate client_secret if provided (public PKCE clients may omit it)
     if (client_secret && client_secret !== CLIENT_SECRET) {
       res.status(401).json({ error: "invalid_client" });
       return;
     }
-    let payload: { k: string; cc: string; cm: string };
-    try { payload = JSON.parse(Buffer.from(code, "base64url").toString()); } catch { payload = { k: "", cc: "", cm: "" }; }
-    if (payload.k !== apiKey) {
+    // Verify the signed authorization code (proves we issued it) + expiry.
+    const codeClaims = verifyAuthCode(code ?? "");
+    if (!codeClaims) {
       res.status(401).json({ error: "invalid_grant" });
       return;
     }
-    // Validate PKCE if code_challenge was set
-    if (payload.cc) {
+    // Validate PKCE if a code_challenge was set at authorize time.
+    if (codeClaims.cc) {
       if (!code_verifier) {
         res.status(401).json({ error: "invalid_grant", error_description: "code_verifier required" });
         return;
       }
       const { createHash } = await import("crypto");
       const digest = createHash("sha256").update(code_verifier).digest("base64url");
-      if (digest !== payload.cc) {
+      if (digest !== codeClaims.cc) {
         res.status(401).json({ error: "invalid_grant", error_description: "PKCE verification failed" });
         return;
       }
     }
-    res.json({ access_token: apiKey, token_type: "bearer", expires_in: 86400 });
+    issue();
   });
 
   // ─────────────────────────────────────────────────────────────────────────
